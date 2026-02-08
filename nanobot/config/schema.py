@@ -30,10 +30,20 @@ class FeishuConfig(BaseModel):
     allow_from: list[str] = Field(default_factory=list)  # Allowed user open_ids
 
 
+class DiscordConfig(BaseModel):
+    """Discord channel configuration."""
+    enabled: bool = False
+    token: str = ""  # Bot token from Discord Developer Portal
+    allow_from: list[str] = Field(default_factory=list)  # Allowed user IDs
+    gateway_url: str = "wss://gateway.discord.gg/?v=10&encoding=json"
+    intents: int = 37377  # GUILDS + GUILD_MESSAGES + DIRECT_MESSAGES + MESSAGE_CONTENT
+
+
 class ChannelsConfig(BaseModel):
     """Configuration for chat channels."""
     whatsapp: WhatsAppConfig = Field(default_factory=WhatsAppConfig)
     telegram: TelegramConfig = Field(default_factory=TelegramConfig)
+    discord: DiscordConfig = Field(default_factory=DiscordConfig)
     feishu: FeishuConfig = Field(default_factory=FeishuConfig)
 
 
@@ -55,6 +65,7 @@ class ProviderConfig(BaseModel):
     """LLM provider configuration."""
     api_key: str = ""
     api_base: str | None = None
+    extra_headers: dict[str, str] | None = None  # Custom headers (e.g. APP-Code for AiHubMix)
 
 
 class ProvidersConfig(BaseModel):
@@ -62,10 +73,14 @@ class ProvidersConfig(BaseModel):
     anthropic: ProviderConfig = Field(default_factory=ProviderConfig)
     openai: ProviderConfig = Field(default_factory=ProviderConfig)
     openrouter: ProviderConfig = Field(default_factory=ProviderConfig)
+    deepseek: ProviderConfig = Field(default_factory=ProviderConfig)
     groq: ProviderConfig = Field(default_factory=ProviderConfig)
     zhipu: ProviderConfig = Field(default_factory=ProviderConfig)
+    dashscope: ProviderConfig = Field(default_factory=ProviderConfig)  # 阿里云通义千问
     vllm: ProviderConfig = Field(default_factory=ProviderConfig)
     gemini: ProviderConfig = Field(default_factory=ProviderConfig)
+    moonshot: ProviderConfig = Field(default_factory=ProviderConfig)
+    aihubmix: ProviderConfig = Field(default_factory=ProviderConfig)  # AiHubMix API gateway
 
 
 class GatewayConfig(BaseModel):
@@ -88,13 +103,13 @@ class WebToolsConfig(BaseModel):
 class ExecToolConfig(BaseModel):
     """Shell exec tool configuration."""
     timeout: int = 60
-    restrict_to_workspace: bool = False  # If true, block commands accessing paths outside workspace
 
 
 class ToolsConfig(BaseModel):
     """Tools configuration."""
     web: WebToolsConfig = Field(default_factory=WebToolsConfig)
     exec: ExecToolConfig = Field(default_factory=ExecToolConfig)
+    restrict_to_workspace: bool = False  # If true, restrict all tool access to workspace directory
 
 
 class Config(BaseSettings):
@@ -110,27 +125,41 @@ class Config(BaseSettings):
         """Get expanded workspace path."""
         return Path(self.agents.defaults.workspace).expanduser()
     
-    def get_api_key(self) -> str | None:
-        """Get API key in priority order: OpenRouter > Anthropic > OpenAI > Gemini > Zhipu > Groq > vLLM."""
-        return (
-            self.providers.openrouter.api_key or
-            self.providers.anthropic.api_key or
-            self.providers.openai.api_key or
-            self.providers.gemini.api_key or
-            self.providers.zhipu.api_key or
-            self.providers.groq.api_key or
-            self.providers.vllm.api_key or
-            None
-        )
+    def get_provider(self, model: str | None = None) -> ProviderConfig | None:
+        """Get matched provider config (api_key, api_base, extra_headers). Falls back to first available."""
+        from nanobot.providers.registry import PROVIDERS
+        model_lower = (model or self.agents.defaults.model).lower()
+
+        # Match by keyword (order follows PROVIDERS registry)
+        for spec in PROVIDERS:
+            p = getattr(self.providers, spec.name, None)
+            if p and any(kw in model_lower for kw in spec.keywords) and p.api_key:
+                return p
+
+        # Fallback: gateways first, then others (follows registry order)
+        for spec in PROVIDERS:
+            p = getattr(self.providers, spec.name, None)
+            if p and p.api_key:
+                return p
+        return None
+
+    def get_api_key(self, model: str | None = None) -> str | None:
+        """Get API key for the given model. Falls back to first available key."""
+        p = self.get_provider(model)
+        return p.api_key if p else None
     
-    def get_api_base(self) -> str | None:
-        """Get API base URL if using OpenRouter, Zhipu or vLLM."""
-        if self.providers.openrouter.api_key:
-            return self.providers.openrouter.api_base or "https://openrouter.ai/api/v1"
-        if self.providers.zhipu.api_key:
-            return self.providers.zhipu.api_base
-        if self.providers.vllm.api_base:
-            return self.providers.vllm.api_base
+    def get_api_base(self, model: str | None = None) -> str | None:
+        """Get API base URL for the given model. Applies default URLs for known gateways."""
+        from nanobot.providers.registry import PROVIDERS
+        p = self.get_provider(model)
+        if p and p.api_base:
+            return p.api_base
+        # Only gateways get a default URL here. Standard providers (like Moonshot)
+        # handle their base URL via env vars in _setup_env, NOT via api_base —
+        # otherwise find_gateway() would misdetect them as local/vLLM.
+        for spec in PROVIDERS:
+            if spec.is_gateway and spec.default_api_base and p == getattr(self.providers, spec.name, None):
+                return spec.default_api_base
         return None
     
     class Config:
